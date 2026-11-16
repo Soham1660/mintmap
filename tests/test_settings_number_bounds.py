@@ -6,6 +6,8 @@
                        time bound and reports the value as dynamic
     PathStabilityTests scan path ids, path fingerprints, routes and candidates are the same as on upstream main
                        (tests/fixtures/demo_scan_paths_main.json); only settings-group fingerprints may change
+    FixtureStabilityTests  the same comparison on three more fixture projects, against upstream main's output stored in
+                       tests/fixtures/path_stability_main.json, and folded arithmetic against main's literal value
 """
 import ast
 import contextlib
@@ -201,6 +203,85 @@ class PathStabilityTests(unittest.TestCase):
         self.assertEqual(now_paths, base["paths"])
         self.assertEqual(now["routes"], base["routes"])
         self.assertEqual(now["candidates"], base["candidates"])
+
+
+class FixtureStabilityTests(unittest.TestCase):
+    """Path results and settings fingerprints on fixture projects beyond the demo.  The expected values are upstream
+    main's own output (tests/fixtures/path_stability_main.json), never this checkout's, so a change in this checkout
+    fails here.  'literal_3600' and 'expression_60x60' scan a copy of the project with one line appended:
+    PASSWORD_RESET_TIMEOUT = 3600 on main, and = 60 * 60 here, which must give the same fingerprints."""
+    BASELINE = os.path.join(PROTO, "tests", "fixtures", "path_stability_main.json")
+    SETTINGS_FILE = {"tests/fixtures/basic_project": os.path.join("proj", "settings.py"),
+                     "tests/fixtures/edge_project": os.path.join("edge", "settings.py"),
+                     "tests/fixtures/urlbuild_project": os.path.join("site_cfg", "settings.py")}
+    KEYS = ("paths", "routes", "candidates", "settings_groups")
+
+    @classmethod
+    def setUpClass(cls):
+        with open(cls.BASELINE, encoding="utf-8") as f:
+            cls.base = json.load(f)["projects"]
+
+    def scan(self, root):
+        tmp = tempfile.mkdtemp(prefix="mintmap-v8-fix-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        out = os.path.join(tmp, "scan.json")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = main(["scan", root, "--json", out])
+        self.assertEqual(code, 0, buf.getvalue())
+        with open(out, encoding="utf-8") as f:
+            d = json.load(f)
+        return {"paths": [{"id": p["id"], "entry_id": p["entry"]["id"], "chain": p["chain"],
+                           "fingerprint": p["fingerprint"], "gaps": p["gaps"]} for p in d["paths"]],
+                "routes": d["routes"], "candidates": d["candidates"],
+                "settings_groups": sorted([{"id": g["id"], "names": g["names"], "fingerprint": g["fingerprint"]}
+                                           for g in d["settings_groups"]], key=lambda g: g["id"])}
+
+    def variant(self, rel, value):
+        """A copy of the fixture with `PASSWORD_RESET_TIMEOUT = value` appended to its settings file."""
+        tmp = tempfile.mkdtemp(prefix="mintmap-v8-variant-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        dst = os.path.join(tmp, "proj")
+        shutil.copytree(os.path.join(PROTO, rel), dst)
+        with open(os.path.join(dst, self.SETTINGS_FILE[rel]), "a", encoding="utf-8") as f:
+            f.write("\nPASSWORD_RESET_TIMEOUT = " + value + "\n")
+        return dst
+
+    def test_unmodified_fixtures_match_upstream_main(self):
+        for rel in self.SETTINGS_FILE:
+            with self.subTest(project=rel):
+                now = self.scan(os.path.join(PROTO, rel))
+                want = self.base[rel]["unmodified"]
+                for key in self.KEYS:
+                    self.assertEqual(now[key], want[key], key)
+
+    def test_demo_settings_change_only_for_the_folded_group(self):
+        now = {g["id"]: g for g in self.scan(os.path.join(PROTO, "examples", "demo"))["settings_groups"]}
+        want = {g["id"]: g for g in self.base["examples/demo"]["settings_groups_only"]}
+        self.assertEqual(sorted(now), sorted(want))
+        changed = sorted(k for k in want if now[k] != want[k])
+        self.assertEqual(changed, ["settings:package:django"])       # the only group with `60 * 60`
+        self.assertEqual(now["settings:package:django"]["names"], ["PASSWORD_RESET_TIMEOUT"])
+        self.assertNotEqual(now["settings:package:django"]["fingerprint"]["settings"],
+                            want["settings:package:django"]["fingerprint"]["settings"])
+
+    def test_folded_arithmetic_matches_upstream_literal(self):
+        for rel in self.SETTINGS_FILE:
+            with self.subTest(project=rel):
+                now = self.scan(self.variant(rel, "60 * 60"))
+                want = self.base[rel]["literal_3600"]
+                for key in self.KEYS:
+                    self.assertEqual(now[key], want[key], key)
+
+    def test_upstream_treated_the_expression_as_a_change(self):
+        # Sanity check on the baseline itself: without folding, `60 * 60` and `3600` have different fingerprints,
+        # so the comparison above is not vacuous.
+        for rel in self.SETTINGS_FILE:
+            with self.subTest(project=rel):
+                lit = {g["id"]: g for g in self.base[rel]["literal_3600"]["settings_groups"]}
+                expr = {g["id"]: g for g in self.base[rel]["expression_60x60"]["settings_groups"]}
+                self.assertEqual(sorted(lit), sorted(expr))
+                self.assertEqual([k for k in lit if lit[k] != expr[k]], ["settings:package:django"])
 
 
 class NegativeLiteralTests(unittest.TestCase):
